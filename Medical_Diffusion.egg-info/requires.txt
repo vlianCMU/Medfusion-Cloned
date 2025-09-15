@@ -1,0 +1,16 @@
+torch
+numpy
+scikit-learn
+pytorch-lightning
+pytorch_msssim
+monai
+torchmetrics
+torch-fidelity
+torchio
+pillow
+einops
+torchvision
+matplotlib
+pandas
+lpips
+streamlit

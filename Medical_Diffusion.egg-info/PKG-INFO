@@ -1,3 +1,32 @@
+Metadata-Version: 2.4
+Name: Medical-Diffusion
+Version: 1.0
+Summary: Diffusion model for medical images
+Author: 
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: torch
+Requires-Dist: numpy
+Requires-Dist: scikit-learn
+Requires-Dist: pytorch-lightning
+Requires-Dist: pytorch_msssim
+Requires-Dist: monai
+Requires-Dist: torchmetrics
+Requires-Dist: torch-fidelity
+Requires-Dist: torchio
+Requires-Dist: pillow
+Requires-Dist: einops
+Requires-Dist: torchvision
+Requires-Dist: matplotlib
+Requires-Dist: pandas
+Requires-Dist: lpips
+Requires-Dist: streamlit
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary
+
 Medfusion - Medical Denoising Diffusion Probabilistic Model 
 =============
 
