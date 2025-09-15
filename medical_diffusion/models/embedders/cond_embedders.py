@@ -25,7 +25,7 @@ class LabelEmbedder(nn.Module):
     
 class FundusDiseaseEmbedder(nn.Module):
     """眼底疾病条件嵌入器"""
-    def __init__(self, emb_dim=512, num_diseases=7, act_name=("SWISH", {})):
+    def __init__(self, emb_dim=512, num_diseases=6, act_name=("SWISH", {})):
         super().__init__()
         self.emb_dim = emb_dim
         self.num_diseases = num_diseases

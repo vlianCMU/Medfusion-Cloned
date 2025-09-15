@@ -15,7 +15,7 @@ Fix: pipeline.sample requires `img_size` instead of `sample_shape`.
 """
 
 # ===================== User Config =====================
-CKPT_PATH = "/data1/lhy/medfusion-main/runs/2025_09_11_052246/lightning_logs/version_0/checkpoints/epoch=2-step=1400.ckpt"
+CKPT_PATH = "/data1/lhy/medfusion-main/runs/2025_09_10_141511/lightning_logs/version_0/checkpoints/epoch=23-step=5500.ckpt"
 
 # Output image size (decoded image size). Training used 256.
 IMG_SIZE = (256, 256)
@@ -24,7 +24,7 @@ LATENT_SHAPE = (8, 32, 32)
 N_SAMPLES = 16
 STEPS = 150
 USE_DDIM = True
-GUIDANCE_SCALE = 1.0
+GUIDANCE_SCALE = 3.0
 
 MODE = "multilabel"  # "multilabel" or "singleclass"
 
@@ -32,7 +32,7 @@ DISEASES = [
     "青光眼",
     "糖尿病性视网膜病变",
     "年龄相关性黄斑变性",
-    "病理性近视",
+    # "病理性近视",
     "白内障",
     "视网膜静脉阻塞",
     "正常眼底",
@@ -41,8 +41,8 @@ DISEASES = [
 COND_PRESETS: List[Dict] = [
     {"label": "unconditional", "vec": None},
     *[{"label": f"{name}", "vec": [1 if i == j else 0 for j in range(len(DISEASES))]} for i, name in enumerate(DISEASES)],
-    {"label": "glaucoma+dr", "vec": [1,1,0,0,0,0,0]},
-    {"label": "dr+amd", "vec": [0,1,1,0,0,0,0]},
+    # {"label": "glaucoma+dr", "vec": [1,1,0,0,0,0,0]},
+    # {"label": "dr+amd", "vec": [0,1,1,0,0,0,0]},
 ]
 
 SINGLECLASS_LIST = [0, 1, 2, 3, 4, 5, 6, None]

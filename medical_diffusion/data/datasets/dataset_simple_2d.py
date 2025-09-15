@@ -211,7 +211,7 @@ class FundusEyeDiseaseDataset(SimpleDataset2D):
             '青光眼', 
             '糖尿病性视网膜病变', 
             '年龄相关性黄斑变性', 
-            '病理性近视',
+            # '病理性近视',
             '白内障',
             '视网膜静脉阻塞',
             '正常眼底'
