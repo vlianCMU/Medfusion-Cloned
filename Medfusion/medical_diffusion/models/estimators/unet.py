@@ -131,7 +131,7 @@ class UNet(nn.Module):
         ])
  
 
-    def forward(self, x_t, t=None, condition=None, self_cond=None):
+    def forward(self, x_t, t=None, condition=None, self_cond=None, control_residuals=None):
         # x_t [B, C, *]
         # t [B,]
         # condition [B,]
@@ -158,12 +158,19 @@ class UNet(nn.Module):
             self_cond =  torch.zeros_like(x_t) if self_cond is None else x_t 
             x_t = torch.cat([x_t, self_cond], dim=1)  
     
+        if control_residuals is not None:
+            assert len(control_residuals) == len(x), "Control residuals must match UNet depth"
+
         # -------- In-Convolution --------------
         x[0] = self.inc(x_t, emb)
+        if control_residuals is not None:
+            x[0] = x[0] + control_residuals[0]
 
         # --------- Encoder --------------
         for i in range(len(self.encoders)):
             x[i+1] = self.encoders[i](x[i], emb)
+            if control_residuals is not None:
+                x[i+1] = x[i+1] + control_residuals[i+1]
 
         # -------- Decoder -----------
         for i in range(len(self.decoders), 0, -1):

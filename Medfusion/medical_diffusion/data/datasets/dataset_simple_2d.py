@@ -386,3 +386,89 @@ class SynFundusDataset(SimpleDataset2D):
     def run_item_crawler(cls, path_root, extension, **kwargs):
         """我们从 CSV 加载，不需要爬取"""
         return []
+
+
+class FundusControlNetDataset(SimpleDataset2D):
+    """Dataset that aligns images, conditioning labels and structural control maps.
+
+    Control images (e.g. vessel masks or optic disc/cup masks) are expected to share the
+    same filename stem as the fundus image.
+    """
+
+    def __init__(
+        self,
+        csv_path: str,
+        image_dir: str,
+        vessel_dir: str,
+        disc_cup_dir: str | None = None,
+        image_column: str = "img_path",
+        label_columns=None,
+        control_ext: str = "png",
+        control_resize: int | None = None,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(path_root=image_dir, item_pointers=[], *args, **kwargs)
+        self.image_dir = Path(image_dir)
+        self.vessel_dir = Path(vessel_dir)
+        self.disc_cup_dir = Path(disc_cup_dir) if disc_cup_dir is not None else None
+        self.image_column = image_column
+        self.control_ext = control_ext
+        self.control_resize = control_resize or kwargs.get("image_resize", None)
+
+        self.labels_df = pd.read_csv(csv_path)
+
+        default_label_columns = [
+            'dr_grade', 'eye_side',
+            'is_amd', 'is_aon', 'is_crp', 'is_dm', 'is_dme',
+            'is_em', 'is_gc', 'is_htr', 'is_pm', 'is_rvo',
+            'is_fundus', 'is_optic_disc_readable', 'is_retinal_region_readable'
+        ]
+        self.label_columns = label_columns or default_label_columns
+
+        self.control_transform = T.Compose([
+            T.Resize(self.control_resize) if self.control_resize is not None else nn.Identity(),
+            T.ToTensor(),
+            T.Normalize(mean=0.5, std=0.5)
+        ])
+
+        self.control_channels = (2 if self.disc_cup_dir is not None else 1) * 3
+
+    def __len__(self):
+        return len(self.labels_df)
+
+    def _resolve_image_path(self, row):
+        img_value = Path(row[self.image_column])
+        return img_value if img_value.is_absolute() else (self.image_dir / img_value)
+
+    def _load_control(self, stem: str):
+        control_images = []
+        vessel_path = self.vessel_dir / f"{stem}.{self.control_ext}"
+        control_images.append(Image.open(vessel_path).convert('RGB'))
+
+        if self.disc_cup_dir is not None:
+            disc_cup_path = self.disc_cup_dir / f"{stem}.{self.control_ext}"
+            control_images.append(Image.open(disc_cup_path).convert('RGB'))
+
+        control_tensor = torch.cat([self.control_transform(img) for img in control_images], dim=0)
+        return control_tensor
+
+    def __getitem__(self, index):
+        row = self.labels_df.iloc[index]
+        img_path = self._resolve_image_path(row)
+        img = self.load_item(img_path)
+
+        stem = img_path.stem
+        control_tensor = self._load_control(stem)
+
+        label_tensor = torch.tensor(
+            row[self.label_columns].values.astype(np.float32),
+            dtype=torch.float32
+        )
+
+        return {
+            'source': self.transform(img),
+            'labels': label_tensor,
+            'control': control_tensor,
+            'img_path': str(img_path)
+        }
