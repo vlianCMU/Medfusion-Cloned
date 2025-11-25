@@ -219,12 +219,13 @@ class UNet(nn.Module):
         ])
  
 
-    def forward(self, x_t, t=None, condition=None, self_cond=None):
+    def forward(self, x_t, t=None, condition=None, self_cond=None, control_residuals=None):
         # x_t [B, C, *]
         # t [B,]
         # condition [B,]
         # self_cond [B, C, *]
-        
+        # control_residuals: kept for API compatibility with control-aware pipelines
+
 
         # -------- Time Embedding (Gloabl) -----------
         if t is None:

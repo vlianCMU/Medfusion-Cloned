@@ -22,13 +22,17 @@ class DiffusionPipeline(BasicModel):
         noise_scheduler,
         noise_estimator,
         latent_embedder=None,
+        controlnet=None,
         noise_scheduler_kwargs={},
         noise_estimator_kwargs={},
         latent_embedder_checkpoint='',
+        controlnet_kwargs=None,
         estimator_objective = 'x_T', # 'x_T' or 'x_0'
-        estimate_variance=False, 
-        use_self_conditioning=False, 
-        classifier_free_guidance_dropout=0.5, # Probability to drop condition during training, has only an effect for label-conditioned training 
+        estimate_variance=False,
+        use_self_conditioning=False,
+        classifier_free_guidance_dropout=0.5, # Probability to drop condition during training, has only an effect for label-conditioned training
+        controlnet_cond_dropout=0.0,
+        controlnet_scale=1.0,
         num_samples = 4,
         do_input_centering = True, # Only for training
         clip_x0=True, # Has only an effect during traing if use_self_conditioning=True, import for inference/sampling  
@@ -50,8 +54,11 @@ class DiffusionPipeline(BasicModel):
         noise_estimator_kwargs['estimate_variance'] = estimate_variance
         noise_estimator_kwargs['use_self_conditioning'] = use_self_conditioning
 
+        controlnet_kwargs = controlnet_kwargs or {}
+
         self.noise_scheduler = noise_scheduler(**noise_scheduler_kwargs)
         self.noise_estimator = noise_estimator(**noise_estimator_kwargs)
+        self.controlnet = controlnet(**controlnet_kwargs) if controlnet is not None else None
         
         with torch.no_grad():
             if latent_embedder is not None:
@@ -65,30 +72,51 @@ class DiffusionPipeline(BasicModel):
         self.use_self_conditioning = use_self_conditioning
         self.num_samples = num_samples
         self.classifier_free_guidance_dropout = classifier_free_guidance_dropout
+        self.controlnet_cond_dropout = controlnet_cond_dropout
         self.do_input_centering = do_input_centering
         self.estimate_variance = estimate_variance
         self.clip_x0 = clip_x0
+        self.controlnet_scale = controlnet_scale
 
         self.use_ema = use_ema
         if use_ema:
             self.ema_model = EMAModel(self.noise_estimator, **ema_kwargs)
 
 
+    def _encode_latent(self, x):
+        if self.latent_embedder is not None:
+            self.latent_embedder.eval()
+            with torch.no_grad():
+                x = self.latent_embedder.encode(x)
+        if self.do_input_centering:
+            x = 2 * x - 1
+        return x
+
+    def _prepare_control(self, control, t, condition):
+        if (self.controlnet is None) or (control is None):
+            return None
+
+        if self.controlnet_cond_dropout > 0 and torch.rand(1) < self.controlnet_cond_dropout:
+            return None
+
+        control_latent = self._encode_latent(control)
+        residuals = self.controlnet(control_latent, t, condition)
+
+        if isinstance(self.controlnet_scale, (list, tuple)):
+            scaled = [r * float(self.controlnet_scale[min(i, len(self.controlnet_scale) - 1)]) for i, r in enumerate(residuals)]
+        else:
+            scaled = [r * float(self.controlnet_scale) for r in residuals]
+        return scaled
+
+
 
     def _step(self, batch: dict, batch_idx: int, state: str, step: int, optimizer_idx:int):
         results = {}
-        x_0 = batch['source']
+        x_0 = self._encode_latent(batch['source'])
         labels = batch.get('labels', None)
+        control = batch.get('control', None)
         condition = labels if labels is not None else None
-
-        # Embed into latent space or normalize 
-        if self.latent_embedder is not None:
-            self.latent_embedder.eval() 
-            with torch.no_grad():
-                x_0 = self.latent_embedder.encode(x_0)
-        
-        if self.do_input_centering:
-            x_0 = 2*x_0-1 # [0, 1] -> [-1, 1]
+        control_residuals = None
 
         # if self.clip_x0:
         #     x_0 = torch.clamp(x_0, -1, 1)
@@ -109,9 +137,10 @@ class DiffusionPipeline(BasicModel):
         self_cond = None 
         if self.use_self_conditioning:
             with torch.no_grad():
-                pred, pred_vertical = noise_estimator(x_t, t, condition, None) 
+                control_residuals = self._prepare_control(control, t, condition) if control_residuals is None else control_residuals
+                pred, pred_vertical = noise_estimator(x_t, t, condition, None, control_residuals)
                 if self.estimate_variance:
-                    pred, _ =  pred.chunk(2, dim = 1)  # Seperate actual prediction and variance estimation 
+                    pred, _ =  pred.chunk(2, dim = 1)  # Seperate actual prediction and variance estimation
                 if self.estimator_objective == "x_T": # self condition on x_0 
                     self_cond = self.noise_scheduler.estimate_x_0(x_t, pred, t=t, clip_x0=self.clip_x0)
                 elif self.estimator_objective == "x_0": # self condition on x_T 
@@ -124,7 +153,10 @@ class DiffusionPipeline(BasicModel):
             condition = None 
        
         # Run Denoise 
-        pred, pred_vertical = noise_estimator(x_t, t, condition, self_cond) 
+        if control_residuals is None:
+            control_residuals = self._prepare_control(control, t, condition)
+
+        pred, pred_vertical = noise_estimator(x_t, t, condition, self_cond, control_residuals)
         
         # Separate variance (scale) if it was learned 
         if self.estimate_variance:
@@ -217,6 +249,7 @@ class DiffusionPipeline(BasicModel):
                 num_samples=self.num_samples,
                 img_size=x_0.shape[1:],
                 condition=sample_cond,
+                control=control,
                 use_ddim=True,
             ).detach()
              
@@ -239,7 +272,7 @@ class DiffusionPipeline(BasicModel):
         return loss
 
     
-    def forward(self, x_t, t, condition=None, self_cond=None, guidance_scale=1.0, cold_diffusion=False, un_cond=None):
+    def forward(self, x_t, t, condition=None, self_cond=None, guidance_scale=1.0, cold_diffusion=False, un_cond=None, control_residuals=None):
         # Note: x_t expected to be in range ~ [-1, 1]
         if self.use_ema:
             noise_estimator = self.ema_model.averaged_model
@@ -249,8 +282,8 @@ class DiffusionPipeline(BasicModel):
         # Concatenate inputs for guided and unguided diffusion as proposed by classifier-free-guidance
         if (condition is not None) and (guidance_scale != 1.0):
             # Model prediction 
-            pred_uncond, _ = noise_estimator(x_t, t, condition=un_cond, self_cond=self_cond)
-            pred_cond, _ = noise_estimator(x_t, t, condition=condition, self_cond=self_cond)
+            pred_uncond, _ = noise_estimator(x_t, t, condition=un_cond, self_cond=self_cond, control_residuals=control_residuals)
+            pred_cond, _ = noise_estimator(x_t, t, condition=condition, self_cond=self_cond, control_residuals=control_residuals)
             pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
 
             if self.estimate_variance:
@@ -258,7 +291,7 @@ class DiffusionPipeline(BasicModel):
                 pred_cond,   pred_var_cond =  pred_cond.chunk(2, dim = 1) 
                 pred_var = pred_var_uncond + guidance_scale * (pred_var_cond - pred_var_uncond)
         else:
-            pred, _ =  noise_estimator(x_t, t, condition=condition, self_cond=self_cond)
+            pred, _ =  noise_estimator(x_t, t, condition=condition, self_cond=self_cond, control_residuals=control_residuals)
             if self.estimate_variance:
                 pred, pred_var =  pred.chunk(2, dim = 1)  
 
@@ -286,8 +319,8 @@ class DiffusionPipeline(BasicModel):
 
 
     @torch.no_grad()
-    def denoise(self, x_t, steps=None, condition=None, use_ddim=True, **kwargs):
-        self_cond = None 
+    def denoise(self, x_t, steps=None, condition=None, use_ddim=True, control=None, **kwargs):
+        self_cond = None
 
         # ---------- run denoise loop ---------------
         if use_ddim:
@@ -301,7 +334,8 @@ class DiffusionPipeline(BasicModel):
             st_prog_bar.progress((i+1)/len(timesteps_array))
 
             # UNet prediction 
-            x_t, x_0, x_T, self_cond = self(x_t, t.expand(x_t.shape[0]), condition, self_cond=self_cond, **kwargs)
+            control_residuals = self._prepare_control(control, t.expand(x_t.shape[0]), condition)
+            x_t, x_0, x_T, self_cond = self(x_t, t.expand(x_t.shape[0]), condition, self_cond=self_cond, control_residuals=control_residuals, **kwargs)
             self_cond = self_cond if self.use_self_conditioning else None  
         
             if use_ddim and (steps-i-1>0):
@@ -320,11 +354,11 @@ class DiffusionPipeline(BasicModel):
         return x_t # Should be x_0 in final step (t=0)
 
     @torch.no_grad()
-    def sample(self, num_samples, img_size, condition=None, **kwargs):
+    def sample(self, num_samples, img_size, condition=None, control=None, **kwargs):
         template = torch.zeros((num_samples, *img_size), device=self.device)
         x_T = self.noise_scheduler.x_final(template)
-        x_0 = self.denoise(x_T, condition=condition, **kwargs)
-        return x_0 
+        x_0 = self.denoise(x_T, condition=condition, control=control, **kwargs)
+        return x_0
 
 
     @torch.no_grad()
