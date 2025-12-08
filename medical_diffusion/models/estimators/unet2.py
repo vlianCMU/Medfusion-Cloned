@@ -1,18 +1,33 @@
-
 import torch 
 import torch.nn as nn 
 from monai.networks.blocks import UnetOutBlock
 
-from medical_diffusion.models.utils.conv_blocks import BasicBlock, UpBlock, DownBlock, UnetBasicBlock, UnetResBlock, save_add, BasicDown, BasicUp, SequentialEmb
+from medical_diffusion.models.utils.conv_blocks import (
+    BasicBlock, 
+    UpBlock, 
+    DownBlock, 
+    UnetBasicBlock, 
+    UnetResBlock, 
+    save_add, 
+    BasicDown, 
+    BasicUp, 
+    SequentialEmb
+)
 from medical_diffusion.models.embedders import TimeEmbbeding
 from medical_diffusion.models.utils.attention_blocks import Attention, zero_module
 
 
-
-
-
-
 class UNet(nn.Module):
+    """UNet2 with ControlNet support.
+    
+    这个 UNet 设计用于在 latent 空间 (32x32) 进行扩散，
+    并支持从 ControlNet 接收控制残差。
+    
+    ControlNet residuals 预期形状:
+        - residuals[0]: [B, 256, 32, 32]  加到 in_conv 输出后
+        - residuals[1]: [B, 512, 16, 16]  加到 16x16 第一个 ResBlock 之后
+        - residuals[2]: [B, 1024, 8, 8]   加到 8x8  第一个 ResBlock 之后
+    """
 
     def __init__(self, 
             in_ch=1, 
@@ -58,7 +73,6 @@ class UNet(nn.Module):
         else:
             self.cond_embedder = None 
             cond_emb_dim = None 
-
 
         ConvBlock = UnetResBlock if use_res_block else UnetBasicBlock
 
@@ -114,8 +128,30 @@ class UNet(nn.Module):
                     )
                 )
  
-
         self.in_blocks = nn.ModuleList(in_blocks)
+        
+        # ----------- 记录 DownBlock 的位置索引 -----------
+        # 对 depth=4, num_res_blocks=2:
+        # in_blocks:
+        #   0: i=1, k=0 ResBlock (32x32, 256)
+        #   1: i=1, k=1 ResBlock (32x32, 256)
+        #   2: i=1 DownBlock      (32→16, 256)
+        #   3: i=2, k=0 ResBlock (16x16, 512)
+        #   4: i=2, k=1 ResBlock (16x16, 512)
+        #   5: i=2 DownBlock      (16→8, 512)
+        #   6: i=3, k=0 ResBlock ( 8x8, 1024)
+        #   7: i=3, k=1 ResBlock ( 8x8, 1024)
+        #
+        # 我们希望：
+        #   residuals[1] 加在 16x16 第一个 ResBlock 之后 → index = first_down_idx + 1
+        #   residuals[2] 加在  8x8 第一个 ResBlock 之后 → index = second_down_idx + 1
+        self.downblock_indices = []
+        block_idx = 0
+        for i in range(1, self.depth):
+            block_idx += num_res_blocks  # ResBlocks
+            if i < self.depth - 1:
+                self.downblock_indices.append(block_idx)  # DownBlock 位置
+                block_idx += 1
         
         # ----------- Middle ------------
         self.middle_block = SequentialEmb(
@@ -155,8 +191,6 @@ class UNet(nn.Module):
             )
         )
 
- 
-     
         # ------------ Decoder ----------
         out_blocks = [] 
         for i in range(1, self.depth):
@@ -220,20 +254,32 @@ class UNet(nn.Module):
  
 
     def forward(self, x_t, t=None, condition=None, self_cond=None, control_residuals=None):
-        # x_t [B, C, *]
-        # t [B,]
-        # condition [B,]
-        # self_cond [B, C, *]
-        # control_residuals: kept for API compatibility with control-aware pipelines
-
-
-        # -------- Time Embedding (Gloabl) -----------
+        """
+        Forward pass with ControlNet support.
+        
+        Parameters
+        ----------
+        x_t : torch.Tensor
+            Noisy latent, shape [B, C, H, W] (e.g., [B, 8, 32, 32])
+        t : torch.Tensor
+            Timestep, shape [B,]
+        condition : torch.Tensor
+            Conditioning labels, shape [B, num_labels]
+        self_cond : torch.Tensor
+            Self-conditioning input (optional)
+        control_residuals : list of torch.Tensor or None
+            List of 3 residual tensors from ControlNet:
+            - residuals[0]: [B, 256, 32, 32] - 加到 in_conv 输出后
+            - residuals[1]: [B, 512, 16, 16] - 加到 16x16 第一层 ResBlock 之后
+            - residuals[2]: [B, 1024, 8, 8]  - 加到  8x8 第一层 ResBlock 之后
+        """
+        # -------- Time Embedding (Global) -----------
         if t is None:
             time_emb = None 
         else:
             time_emb = self.time_embedder(t) # [B, C]
 
-        # -------- Condition Embedding (Gloabl) -----------
+        # -------- Condition Embedding (Global) -----------
         if (condition is None) or (self.cond_embedder is None):
             cond_emb = None  
         else:
@@ -247,9 +293,36 @@ class UNet(nn.Module):
             x_t = torch.cat([x_t, self_cond], dim=1)  
     
         # --------- Encoder --------------
+        # in_conv: 输入卷积
         x = [self.in_conv(x_t)]
+        
+        # 添加第一个 control_residual (32x32, 256ch)
+        if control_residuals is not None and len(control_residuals) > 0:
+            x[0] = x[0] + control_residuals[0]
+        
+        # 通过 in_blocks
         for i in range(len(self.in_blocks)):
             x.append(self.in_blocks[i](x[i], emb))
+            
+            # ---- 在正确的尺度注入 control_residuals[1]/[2] ----
+            if control_residuals is not None:
+                # 16x16 注入点：第一个 DownBlock 之后的第一个 ResBlock
+                if (
+                    len(self.downblock_indices) > 0
+                    and i == self.downblock_indices[0] + 1
+                    and len(control_residuals) > 1
+                ):
+                    # 当前 x[-1] 形状: [B, 512, 16, 16]
+                    x[-1] = x[-1] + control_residuals[1]
+
+                # 8x8 注入点：第二个 DownBlock 之后的第一个 ResBlock
+                if (
+                    len(self.downblock_indices) > 1
+                    and i == self.downblock_indices[1] + 1
+                    and len(control_residuals) > 2
+                ):
+                    # 当前 x[-1] 形状: [B, 1024, 8, 8]
+                    x[-1] = x[-1] + control_residuals[2]
 
         # ---------- Middle --------------
         h = self.middle_block(x[-1], emb)
@@ -268,13 +341,3 @@ class UNet(nn.Module):
         y = self.outc(h)
 
         return y, y_ver[::-1]
-
-
-
-
-if __name__=='__main__':
-    model = UNet(in_ch=3, use_res_block=False, learnable_interpolation=False)
-    input = torch.randn((1,3,16,32,32))
-    time = torch.randn((1,))
-    out_hor, out_ver = model(input, time)
-    print(out_hor[0].shape)

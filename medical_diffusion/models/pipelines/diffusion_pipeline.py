@@ -1,4 +1,11 @@
+"""
+Diffusion Pipeline with ControlNet Support
 
+这个版本的 DiffusionPipeline 完全支持 ControlNet：
+- ControlNet 处理 256x256 的分割图
+- 产生 3 个 residuals 注入到 UNet2 的编码器
+- 不对 control 图像进行 VAE 编码
+"""
 
 from pathlib import Path 
 from tqdm import tqdm
@@ -11,10 +18,6 @@ import streamlit as st
 from medical_diffusion.models import BasicModel
 from medical_diffusion.utils.train_utils import EMAModel
 from medical_diffusion.utils.math_utils import kl_gaussians
-
-
-
-
 
 
 class DiffusionPipeline(BasicModel):
@@ -30,23 +33,22 @@ class DiffusionPipeline(BasicModel):
         estimator_objective = 'x_T', # 'x_T' or 'x_0'
         estimate_variance=False,
         use_self_conditioning=False,
-        classifier_free_guidance_dropout=0.5, # Probability to drop condition during training, has only an effect for label-conditioned training
+        classifier_free_guidance_dropout=0.5,
         controlnet_cond_dropout=0.0,
-        controlnet_scale=4.0,
+        controlnet_scale=1.0,  # 可以是标量或列表
         num_samples = 4,
-        do_input_centering = True, # Only for training
-        clip_x0=True, # Has only an effect during traing if use_self_conditioning=True, import for inference/sampling  
+        do_input_centering = True,
+        clip_x0=True,
         use_ema = False,
         ema_kwargs = {},
         optimizer=torch.optim.AdamW, 
-        optimizer_kwargs={'lr':1e-4}, # stable-diffusion ~ 1e-4
-        lr_scheduler= None, # stable-diffusion - LambdaLR
+        optimizer_kwargs={'lr':1e-4},
+        lr_scheduler= None,
         lr_scheduler_kwargs={}, 
         loss=torch.nn.L1Loss,
         loss_kwargs={},
         sample_every_n_steps = 1000
         ):
-        # self.save_hyperparameters(ignore=['noise_estimator', 'noise_scheduler']) 
         super().__init__(optimizer, optimizer_kwargs, lr_scheduler, lr_scheduler_kwargs)
         self.loss_fct = loss(**loss_kwargs)
         self.sample_every_n_steps=sample_every_n_steps
@@ -59,6 +61,13 @@ class DiffusionPipeline(BasicModel):
         self.noise_scheduler = noise_scheduler(**noise_scheduler_kwargs)
         self.noise_estimator = noise_estimator(**noise_estimator_kwargs)
         self.controlnet = controlnet(**controlnet_kwargs) if controlnet is not None else None
+        
+        # 冻结 ControlNet 的条件嵌入器（如果使用与 UNet 相同的嵌入器）
+        # 这样可以节省内存，因为嵌入器参数是共享的
+        if self.controlnet is not None:
+            # 冻结 latent embedder
+            for param in self.controlnet.parameters():
+                param.requires_grad = True  # ControlNet 需要训练
         
         with torch.no_grad():
             if latent_embedder is not None:
@@ -84,6 +93,7 @@ class DiffusionPipeline(BasicModel):
 
 
     def _encode_latent(self, x):
+        """将图像编码到 latent 空间"""
         if self.latent_embedder is not None:
             self.latent_embedder.eval()
             with torch.no_grad():
@@ -93,111 +103,136 @@ class DiffusionPipeline(BasicModel):
         return x
 
     def _prepare_control(self, control, t, condition):
+        """
+        准备 ControlNet 的控制残差。
+        
+        重要：control 图像 (256x256) 不需要 VAE 编码！
+        ControlNet 直接处理原始分割图，然后通过自己的编码器
+        产生与 latent 空间 UNet 匹配的 residuals。
+        
+        Parameters
+        ----------
+        control : torch.Tensor
+            控制图像，shape [B, 3, 256, 256]
+        t : torch.Tensor
+            时间步，shape [B,]
+        condition : torch.Tensor
+            条件标签，shape [B, num_labels]
+        
+        Returns
+        -------
+        residuals : list of torch.Tensor or None
+            控制残差列表，每个元素的 shape 分别为:
+            - [B, 256, 32, 32]
+            - [B, 512, 16, 16]
+            - [B, 1024, 8, 8]
+        """
         if (self.controlnet is None) or (control is None):
             return None
-        
-        # ✅ 修改1: 采样时禁用 dropout
-        if self.training and self.controlnet_cond_dropout > 0 and torch.rand(1) < self.controlnet_cond_dropout:
-            return None
-        
-        # ✅ 修改2: 不对 control 做 VAE 编码!
-        # control_latent = self._encode_latent(control)  # ❌ 删除这行
-        
-        # ✅ 直接使用原始 control
+
+        # dropout only disables conditioning
+        if self.training and self.controlnet_cond_dropout > 0:
+            if torch.rand(1).item() < self.controlnet_cond_dropout:
+                return None
+
+        # ❗ ensure grad is tracked (no no_grad!)
         residuals = self.controlnet(control, t, condition)
-        
-        if isinstance(self.controlnet_scale, (list, tuple)):
-            scaled = [r * float(self.controlnet_scale[min(i, len(self.controlnet_scale) - 1)]) for i, r in enumerate(residuals)]
+
+        # apply scale
+        if isinstance(self.controlnet_scale, (tuple, list)):
+            scaled = [
+                r * float(self.controlnet_scale[min(i, len(self.controlnet_scale)-1)])
+                for i, r in enumerate(residuals)
+            ]
         else:
             scaled = [r * float(self.controlnet_scale) for r in residuals]
+
         return scaled
 
 
-
-    def _step(self, batch: dict, batch_idx: int, state: str, step: int, optimizer_idx:int):
+    def _step(self, batch: dict, batch_idx: int, state: str, step: int, optimizer_idx: int):
+        """训练/验证步骤"""
         results = {}
+        
+        # 编码源图像到 latent 空间
         x_0 = self._encode_latent(batch['source'])
         labels = batch.get('labels', None)
         control = batch.get('control', None)
         condition = labels if labels is not None else None
-        control_residuals = None
 
-        # if self.clip_x0:
-        #     x_0 = torch.clamp(x_0, -1, 1)
-        
-
-        # Sample Noise
+        # 采样噪声
         with torch.no_grad():
-            # Randomly selecting t [0,T-1] and compute x_t (noisy version of x_0 at t)
             x_t, x_T, t = self.noise_scheduler.sample(x_0) 
                 
-        # Use EMA Model
+        # 选择模型
         if self.use_ema and (state != 'train'):
             noise_estimator = self.ema_model.averaged_model
         else:
             noise_estimator = self.noise_estimator
 
-        # Re-estimate x_T or x_0, self-conditioned on previous estimate 
-        self_cond = None 
+        # 准备 control residuals
+        control_residuals = self._prepare_control(control, t, condition)
+
+        # Self-conditioning
+        self_cond = None
         if self.use_self_conditioning:
+
+            # ❗ 禁止 control 分支参与 self-conditioning
             with torch.no_grad():
-                control_residuals = self._prepare_control(control, t, condition) if control_residuals is None else control_residuals
-                pred, pred_vertical = noise_estimator(x_t, t, condition, None, control_residuals)
-                if self.estimate_variance:
-                    pred, _ =  pred.chunk(2, dim = 1)  # Seperate actual prediction and variance estimation
-                if self.estimator_objective == "x_T": # self condition on x_0 
-                    self_cond = self.noise_scheduler.estimate_x_0(x_t, pred, t=t, clip_x0=self.clip_x0)
-                elif self.estimator_objective == "x_0": # self condition on x_T 
-                    self_cond = self.noise_scheduler.estimate_x_T(x_t, pred, t=t, clip_x0=self.clip_x0)
-                else:
-                    raise NotImplementedError(f"Option estimator_target={self.estimator_objective} not supported.")
-            
-        # Classifier free guidance 
-        if torch.rand(1)<self.classifier_free_guidance_dropout:
-            condition = None 
-       
-        # Run Denoise 
-        if control_residuals is None:
-            control_residuals = self._prepare_control(control, t, condition)
+                pred_sc, _ = noise_estimator(
+                    x_t, t, condition=condition, self_cond=None, control_residuals=None
+                )
 
+            if self.estimate_variance:
+                pred_sc, _ = pred_sc.chunk(2, dim=1)
+
+            if self.estimator_objective == "x_T":
+                self_cond = self.noise_scheduler.estimate_x_0(
+                    x_t, pred_sc, t=t, clip_x0=self.clip_x0
+                )
+            else:
+                self_cond = self.noise_scheduler.estimate_x_T(
+                    x_t, pred_sc, t=t, clip_x0=self.clip_x0
+                )
+
+        # Classifier-free guidance dropout
+        if self.classifier_free_guidance_dropout > 0:
+            drop_mask = torch.rand(condition.shape[0], device=condition.device) < self.classifier_free_guidance_dropout
+            condition = condition.clone()
+            condition[drop_mask] = 0
+
+        # 模型预测
         pred, pred_vertical = noise_estimator(x_t, t, condition, self_cond, control_residuals)
-        
-        # Separate variance (scale) if it was learned 
         if self.estimate_variance:
-            pred, pred_var =  pred.chunk(2, dim = 1)  # Separate actual prediction and variance estimation 
+            pred, pred_var = pred.chunk(2, dim=1)
 
-        # Specify target 
+        # 计算目标
         if self.estimator_objective == "x_T":
-            target = x_T 
+            target = x_T
         elif self.estimator_objective == "x_0":
-            target = x_0 
+            target = x_0
         else:
-            raise NotImplementedError(f"Option estimator_target={self.estimator_objective} not supported.")
+            raise NotImplementedError()
 
-        
-        # ------------------------- Compute Loss ---------------------------
+        # 计算损失
         interpolation_mode = 'area'
         loss = 0
-        weights = [1/2**i for i in range(1+len(pred_vertical))] # horizontal (equal) + vertical (reducing with every step down)
+        weights = [1/2**i for i in range(1 + len(pred_vertical))]
         tot_weight = sum(weights)
         weights = [w/tot_weight for w in weights]
 
-        # ----------------- MSE/L1, ... ----------------------
-        loss += self.loss_fct(pred, target)*weights[0]
+        # MSE/L1 Loss
+        loss += self.loss_fct(pred, target) * weights[0]
 
-        # ----------------- Variance Loss --------------
+        # Variance Loss (如果启用)
         if self.estimate_variance:
-            # var_scale = var_scale.clamp(-1, 1) # Should not be necessary 
-            var_scale = (pred_var+1)/2 # Assumed to be in [-1, 1] -> [0, 1] 
+            var_scale = (pred_var + 1) / 2
             pred_logvar = self.noise_scheduler.estimate_variance_t(t, x_t.ndim, log=True, var_scale=var_scale)
-            # pred_logvar = pred_var  # If variance is estimated directly 
 
-            if  self.estimator_objective == 'x_T':
+            if self.estimator_objective == 'x_T':
                 pred_x_0 = self.noise_scheduler.estimate_x_0(x_t, x_T, t, clip_x0=self.clip_x0)
             elif self.estimator_objective == "x_0":
-                pred_x_0 = pred 
-            else:
-                raise NotImplementedError()
+                pred_x_0 = pred
 
             with torch.no_grad():
                 pred_mean = self.noise_scheduler.estimate_mean_t(x_t, pred_x_0, t)
@@ -212,143 +247,108 @@ class DiffusionPipeline(BasicModel):
             results['variance_scale'] = torch.mean(var_scale)
             results['variance_loss'] = var_loss
 
-            
-        # ----------------------------- Deep Supervision -------------------------
+        # Deep Supervision
         for i, pred_i in enumerate(pred_vertical): 
-            target_i = F.interpolate(target, size=pred_i.shape[2:], mode=interpolation_mode, align_corners=None)  
-            loss += self.loss_fct(pred_i, target_i)*weights[i+1]
-        results['loss']  = loss
+            if pred_i is not None:
+                target_i = F.interpolate(target, size=pred_i.shape[2:], mode=interpolation_mode, align_corners=None)
+                loss += self.loss_fct(pred_i, target_i) * weights[i + 1]
 
-       
-       
-        # --------------------- Compute Metrics  -------------------------------
-        with torch.no_grad():
-            results['L2'] = F.mse_loss(pred, target)
-            results['L1'] = F.l1_loss(pred, target)
-            # results['SSIM'] = SSIMMetric(data_range=pred.max()-pred.min(), spatial_dims=source.ndim-2)(pred, target)
-
-            # for i, pred_i in enumerate(pred_vertical):
-            #     target_i = F.interpolate(target, size=pred_i.shape[2:], mode=interpolation_mode, align_corners=None)  
-            #     results[f'L1_{i}'] = F.l1_loss(pred_i, target_i).detach()
-              
-       
-
-        # ----------------- Log Scalars ----------------------
-        for metric_name, metric_val in results.items():
-            self.log(f"{state}/{metric_name}", metric_val, batch_size=x_0.shape[0], on_step=True, on_epoch=True)           
+        # Logging
+        self.log(f"{state}/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        results['loss'] = loss
         
-        
-        #------------------ Log Image -----------------------
-        if self.global_step != 0 and self.global_step % self.sample_every_n_steps == 0:
-            dataformats =  'NHWC' if x_0.ndim == 5 else 'HWC'
-            def norm(x):
-                return (x-x.min())/(x.max()-x.min())
-
-            if condition is not None:
-                sample_cond = condition[0:self.num_samples]
-            else:
-                sample_cond = None
-
-            if control is not None:
-                sample_control = control[0:self.num_samples]
-            else:
-                sample_control = None
-
-            sample_img = self.sample(
-                num_samples=self.num_samples,
-                img_size=x_0.shape[1:],
-                condition=sample_cond,
-                control=sample_control,
-                use_ddim=True,
-            ).detach()
-             
-            log_step = self.global_step // self.sample_every_n_steps
-            # self.logger.experiment.add_images("predict_img", norm(torch.moveaxis(pred[0,-1:], 0,-1)), global_step=self.current_epoch, dataformats=dataformats) 
-            # self.logger.experiment.add_images("target_img", norm(torch.moveaxis(target[0,-1:], 0,-1)), global_step=self.current_epoch, dataformats=dataformats) 
-            
-            # self.logger.experiment.add_images("source_img", norm(torch.moveaxis(x_0[0,-1:], 0,-1)), global_step=log_step, dataformats=dataformats) 
-            # self.logger.experiment.add_images("sample_img", norm(torch.moveaxis(sample_img[0,-1:], 0,-1)), global_step=log_step, dataformats=dataformats) 
-            
-            path_out = Path(self.logger.log_dir)/'images'
+        # 定期采样
+        if (state == 'train') and (step != 0) and (step % self.sample_every_n_steps == 0):
+            log_step = step // self.sample_every_n_steps
+            path_out = Path(self.logger.log_dir) / 'images'
             path_out.mkdir(parents=True, exist_ok=True)
-            # for 3D images use depth as batch :[D, C, H, W], never show more than 32 images 
+            
+            # 使用 control 条件生成样本（如果可用）
+            with torch.no_grad():
+                sample_control = control[:self.num_samples] if control is not None else None
+                sample_condition = condition[:self.num_samples] if condition is not None else None
+                latent_shape = x_0.shape[1:]
+                sample_img = self.sample(
+                    self.num_samples, 
+                    latent_shape, 
+                    condition=sample_condition, 
+                    control=sample_control
+                )
+            
             def depth2batch(image):
-                return (image if image.ndim<5 else torch.swapaxes(image[0], 0, 1))
+                return (image if image.ndim < 5 else torch.swapaxes(image[0], 0, 1))
             images = depth2batch(sample_img)[:32]
-            save_image(images, path_out/f'sample_{log_step}.png', normalize=True)
-        
+            save_image(images, path_out / f'sample_{log_step}.png', normalize=True)
         
         return loss
 
-    
     def forward(self, x_t, t, condition=None, self_cond=None, guidance_scale=1.0, cold_diffusion=False, un_cond=None, control_residuals=None):
-        # Note: x_t expected to be in range ~ [-1, 1]
+        """前向传播（采样时使用）"""
         if self.use_ema:
             noise_estimator = self.ema_model.averaged_model
         else:
             noise_estimator = self.noise_estimator
 
-        # Concatenate inputs for guided and unguided diffusion as proposed by classifier-free-guidance
+        # Classifier-free guidance
         if (condition is not None) and (guidance_scale != 1.0):
-            # Model prediction 
             pred_uncond, _ = noise_estimator(x_t, t, condition=un_cond, self_cond=self_cond, control_residuals=control_residuals)
             pred_cond, _ = noise_estimator(x_t, t, condition=condition, self_cond=self_cond, control_residuals=control_residuals)
             pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
 
             if self.estimate_variance:
-                pred_uncond, pred_var_uncond =  pred_uncond.chunk(2, dim = 1)  
-                pred_cond,   pred_var_cond =  pred_cond.chunk(2, dim = 1) 
+                pred_uncond, pred_var_uncond = pred_uncond.chunk(2, dim=1)
+                pred_cond, pred_var_cond = pred_cond.chunk(2, dim=1)
                 pred_var = pred_var_uncond + guidance_scale * (pred_var_cond - pred_var_uncond)
         else:
-            pred, _ =  noise_estimator(x_t, t, condition=condition, self_cond=self_cond, control_residuals=control_residuals)
+            pred, _ = noise_estimator(x_t, t, condition=condition, self_cond=self_cond, control_residuals=control_residuals)
             if self.estimate_variance:
-                pred, pred_var =  pred.chunk(2, dim = 1)  
+                pred, pred_var = pred.chunk(2, dim=1)
 
         if self.estimate_variance:
-            pred_var_scale = pred_var/2+0.5 # [-1, 1] -> [0, 1]
-            pred_var_value = pred_var  
+            pred_var_scale = pred_var / 2 + 0.5
+            pred_var_value = pred_var
         else:
             pred_var_scale = 0
-            pred_var_value = None 
+            pred_var_value = None
 
-        # pred_var_scale = pred_var_scale.clamp(0, 1)
-
-        if  self.estimator_objective == 'x_0':
+        if self.estimator_objective == 'x_0':
             x_t_prior, x_0 = self.noise_scheduler.estimate_x_t_prior_from_x_0(x_t, t, pred, clip_x0=self.clip_x0, var_scale=pred_var_scale, cold_diffusion=cold_diffusion)
             x_T = self.noise_scheduler.estimate_x_T(x_t, x_0=pred, t=t, clip_x0=self.clip_x0)
-            self_cond = x_T 
+            self_cond = x_T
         elif self.estimator_objective == 'x_T':
             x_t_prior, x_0 = self.noise_scheduler.estimate_x_t_prior_from_x_T(x_t, t, pred, clip_x0=self.clip_x0, var_scale=pred_var_scale, cold_diffusion=cold_diffusion)
-            x_T = pred 
-            self_cond = x_0 
+            x_T = pred
+            self_cond = x_0
         else:
             raise ValueError("Unknown Objective")
         
-        return x_t_prior, x_0, x_T, self_cond 
+        return x_t_prior, x_0, x_T, self_cond
 
 
     @torch.no_grad()
     def denoise(self, x_t, steps=None, condition=None, use_ddim=True, control=None, **kwargs):
+        """去噪循环"""
         self_cond = None
 
-        # ---------- run denoise loop ---------------
         if use_ddim:
             steps = self.noise_scheduler.timesteps if steps is None else steps
-            timesteps_array = torch.linspace(0, self.noise_scheduler.T-1, steps, dtype=torch.long, device=x_t.device) # [0, 1, 2, ..., T-1] if steps = T 
+            timesteps_array = torch.linspace(0, self.noise_scheduler.T-1, steps, dtype=torch.long, device=x_t.device)
         else:
-            timesteps_array = self.noise_scheduler.timesteps_array[slice(0, steps)] # [0, ...,T-1] (target time not time of x_t)
+            timesteps_array = self.noise_scheduler.timesteps_array[slice(0, steps)]
             
         st_prog_bar = st.progress(0)
         for i, t in tqdm(enumerate(reversed(timesteps_array))):
-            st_prog_bar.progress((i+1)/len(timesteps_array))
+            st_prog_bar.progress((i + 1) / len(timesteps_array))
 
-            # UNet prediction 
+            # 准备 control residuals
             control_residuals = self._prepare_control(control, t.expand(x_t.shape[0]), condition)
+            
+            # UNet 预测
             x_t, x_0, x_T, self_cond = self(x_t, t.expand(x_t.shape[0]), condition, self_cond=self_cond, control_residuals=control_residuals, **kwargs)
-            self_cond = self_cond if self.use_self_conditioning else None  
+            self_cond = self_cond if self.use_self_conditioning else None
         
-            if use_ddim and (steps-i-1>0):
-                t_next = timesteps_array[steps-i-2]
+            if use_ddim and (steps - i - 1 > 0):
+                t_next = timesteps_array[steps - i - 2]
                 alpha = self.noise_scheduler.alphas_cumprod[t]
                 alpha_next = self.noise_scheduler.alphas_cumprod[t_next]
                 sigma = kwargs.get('eta', 1) * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
@@ -356,25 +356,26 @@ class DiffusionPipeline(BasicModel):
                 noise = torch.randn_like(x_t)
                 x_t = x_0 * alpha_next.sqrt() + c * x_T + sigma * noise
 
-        # ------ Eventually decode from latent space into image space--------
+        # 解码到图像空间
         if self.latent_embedder is not None:
             x_t = self.latent_embedder.decode(x_t)
         
-        return x_t # Should be x_0 in final step (t=0)
+        return x_t
 
     @torch.no_grad()
     def sample(self, num_samples, img_size, condition=None, control=None, **kwargs):
+        """生成样本"""
         template = torch.zeros((num_samples, *img_size), device=self.device)
         x_T = self.noise_scheduler.x_final(template)
         x_0 = self.denoise(x_T, condition=condition, control=control, **kwargs)
         return x_0
 
-
     @torch.no_grad()
-    def interpolate(self, img1, img2, i = None, condition=None, lam = 0.5, **kwargs):
+    def interpolate(self, img1, img2, i=None, condition=None, lam=0.5, **kwargs):
+        """插值生成"""
         assert img1.shape == img2.shape, "Image 1 and 2 must have equal shape"
 
-        t = self.noise_scheduler.T-1 if i is None else i
+        t = self.noise_scheduler.T - 1 if i is None else i
         t = torch.full(img1.shape[:1], i, device=img1.device)
 
         img1_t = self.noise_scheduler.estimate_x_t(img1, t=t, clip_x0=self.clip_x0)
@@ -389,7 +390,14 @@ class DiffusionPipeline(BasicModel):
             self.ema_model.step(self.noise_estimator)
     
     def configure_optimizers(self):
-        optimizer = self.optimizer(self.noise_estimator.parameters(), **self.optimizer_kwargs)
+        """配置优化器 - 同时优化 UNet 和 ControlNet"""
+        # 收集所有需要训练的参数
+        params = list(self.noise_estimator.parameters())
+        if self.controlnet is not None:
+            params += list(self.controlnet.parameters())
+        
+        optimizer = self.optimizer(params, **self.optimizer_kwargs)
+        
         if self.lr_scheduler is not None:
             lr_scheduler = {
                 'scheduler': self.lr_scheduler(optimizer, **self.lr_scheduler_kwargs),
@@ -399,3 +407,15 @@ class DiffusionPipeline(BasicModel):
             return [optimizer], [lr_scheduler]
         else:
             return [optimizer]
+
+    def training_step(self, batch, batch_idx):
+        return self._step(batch, batch_idx, "train", self.global_step, 0)
+
+    def validation_step(self, batch, batch_idx):
+        return self._step(batch, batch_idx, "val", self.global_step, 0)
+
+    def save_best_checkpoint(self, log_dir, best_model_path):
+        """保存最佳模型路径到文件"""
+        path_out = Path(log_dir) / 'best_model.txt'
+        with open(path_out, 'w') as f:
+            f.write(str(best_model_path))
