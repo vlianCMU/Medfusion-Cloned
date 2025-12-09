@@ -83,10 +83,7 @@ if __name__ == "__main__":
     time_embedder_kwargs = {"emb_dim": 1024}
 
     # ------------ Diffusion UNet checkpoint ------------
-    diffusion_ckpt = (
-        "/data1/lhy/medfusion-main/new_run/2025_11_05_074811/"
-        "lightning_logs/version_0/checkpoints/last.ckpt"
-    )
+    diffusion_ckpt = "/data1/lhy/medfusion-main/new_run/2025_11_05_074811/lightning_logs/version_0/checkpoints/last.ckpt"
 
     # ------------ UNet config (必须与之前 Diffusion 训练时一致) ------------
     noise_estimator_kwargs = {
@@ -114,8 +111,8 @@ if __name__ == "__main__":
         "strides": [1, 2, 2, 2],
         "time_embedder": TimeEmbbeding,
         "time_embedder_kwargs": time_embedder_kwargs,
-        "cond_embedder": SynFundusConditionEmbedder,
-        "cond_embedder_kwargs": cond_embedder_kwargs,
+        "cond_embedder": None,
+        "cond_embedder_kwargs": {},
     }
 
     # ------------ Noise Scheduler ------------
@@ -143,7 +140,7 @@ if __name__ == "__main__":
         estimate_variance=False,
         use_self_conditioning=False,
         use_ema=False,
-        classifier_free_guidance_dropout=0.1,
+        classifier_free_guidance_dropout=0.0,
         do_input_centering=False,
         clip_x0=False,
         sample_every_n_steps=2000,
@@ -168,7 +165,7 @@ if __name__ == "__main__":
 
     trainer = Trainer(
         accelerator=accelerator,
-        devices=[0,1,3,4],  # 你也可以改成 [0,1,2,3] 或 "auto"
+        devices=[4,5,6,7],  # 你也可以改成 [0,1,2,3] 或 "auto"
         strategy="ddp",
         default_root_dir=str(path_run_dir),
         callbacks=[checkpointing],
