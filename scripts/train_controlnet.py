@@ -83,10 +83,7 @@ if __name__ == "__main__":
     time_embedder_kwargs = {"emb_dim": 1024}
 
     # ------------ Diffusion UNet checkpoint ------------
-    diffusion_ckpt = (
-        "/data1/lhy/medfusion-main/new_run/2025_11_05_074811/"
-        "lightning_logs/version_0/checkpoints/last.ckpt"
-    )
+    diffusion_ckpt = "/data1/lhy/medfusion-main/new_run/2025_11_05_074811/lightning_logs/version_0/checkpoints/last.ckpt"
 
     # ------------ UNet config (必须与之前 Diffusion 训练时一致) ------------
     noise_estimator_kwargs = {
