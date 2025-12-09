@@ -136,7 +136,7 @@ class DiffusionPipeline(BasicModel):
                 return None
 
         # ❗ ensure grad is tracked (no no_grad!)
-        residuals = self.controlnet(control, t, condition=None)
+        residuals = self.controlnet(control, t, condition)
 
         # apply scale
         if isinstance(self.controlnet_scale, (tuple, list)):
